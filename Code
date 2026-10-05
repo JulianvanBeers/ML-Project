@@ -1,0 +1,359 @@
+import os
+import time
+import itertools
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.metrics import (log_loss, accuracy_score, confusion_matrix, classification_report,)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Class order used everywhere: index 0 = win, 1 = draw, 2 = loss (Player 1's view)
+CLASS_ORDER = ["win", "draw", "loss"]
+CLASS_INDICES = [0, 1, 2]
+OUTCOME_TO_INDEX = {1: 0, 0.5: 1, 0: 2}
+OUTCOME_TO_LABEL = {1: "win", 0.5: "draw", 0: "loss"}
+
+
+#Assistance functions for evaluating models and comparing them
+
+def evaluate(true_indices, probs):
+    # Turn class probabilities into predictions and standard metrics
+    pred = probs.argmax(axis=1)
+    return {
+        "pred": pred,
+        "log_loss": log_loss(true_indices, probs, labels=CLASS_INDICES),
+        "accuracy": accuracy_score(true_indices, pred),
+        "confusion": confusion_matrix(true_indices, pred, labels=CLASS_INDICES),}
+
+
+def model_probabilities(model, X):
+    # Get predicted probabilities with columns in win / draw / loss order
+    probs = pd.DataFrame(model.predict_proba(X), columns=model.classes_)
+    return probs[CLASS_ORDER].to_numpy()
+
+
+def per_game_log_loss(true_indices, probs):
+    p = np.clip(probs[np.arange(len(true_indices)), true_indices], 1e-15, 1)
+    return -np.log(p)
+
+
+def paired_log_loss_diff(true_indices, probs_a, probs_b, name_a, name_b):
+    # Compare two models' log loss on the same games, with a 95% interval
+    diff = per_game_log_loss(true_indices, probs_a) - per_game_log_loss(true_indices, probs_b)
+    mean = diff.mean()
+    se = diff.std(ddof=1) / np.sqrt(len(diff))
+    print(f"LogLoss({name_a}) - LogLoss({name_b}) = {mean:+.5f}   "
+          f"95% CI [{mean - 1.96 * se:+.5f}, {mean + 1.96 * se:+.5f}]")
+
+
+# ---------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------
+# Rename columns to shorter names in code (the CSV files were prepared
+# 6 months ago for other uses, so the files themselves stay unchanged)
+COLUMN_MAP = {
+    "game_id": "game_id",
+    "Player1_Elo": "p1_elo",
+    "Player2_Elo": "p2_elo",
+    "Player1_Color": "player_color",  # 1 = Player 1 is White, 0 = Black
+    "Move_i": "move_i",
+    "AverageElo": "avg_elo",
+    "EloDiff": "elo_diff",
+    "Start time": "starting_time",
+    "Increment": "increment",
+    "Player1_Time_Remaining": "p1_time_left",
+    "Player2_Time_Remaining": "p2_time_left",
+    "Turn_Color": "turn",  # 1 = White to move, 0 = Black to move
+    "Stockfish_evaluation_i": "stockfish_eval",
+    "Score": "outcome",  }# 1 = P1 win, 0.5 = draw, 0 = P1 loss}
+
+
+def load(filename):
+    path = os.path.join(SCRIPT_DIR, filename)
+    return pd.read_csv(path).rename(columns=COLUMN_MAP)
+
+
+train_df = load("train.csv")
+val_df = load("val.csv")
+print(f"Loaded {len(train_df)} training games and {len(val_df)} validation games.\n")
+
+#feature building: base features + derived p1_to_move + hand-made interactions
+
+BASE_FEATURES = [
+    "player_color", "move_i", "avg_elo", "elo_diff", "stockfish_eval",
+    "starting_time", "increment", "p1_time_left", "p2_time_left", "turn",]
+
+# Each interaction feature: (new column name, first column, second column)
+INTERACTIONS = [
+    ("elo_diff_x_avg_elo", "elo_diff", "avg_elo"),
+    ("player_color_x_eval", "player_color", "stockfish_eval"),
+    ("move_i_x_eval", "move_i", "stockfish_eval"),
+    ("elo_diff_x_eval", "elo_diff", "stockfish_eval"),
+    ("move_i_x_time_left", "move_i", "p1_time_left"),
+    ("starting_time_x_time_left", "starting_time", "p1_time_left"),
+    ("time_left_x_eval", "p1_time_left", "stockfish_eval"),
+    ("avg_elo_x_eval", "avg_elo", "stockfish_eval"),
+    ("starting_time_x_elo_diff", "starting_time", "elo_diff"),
+    ("starting_time_x_eval", "starting_time", "stockfish_eval"),
+    ("increment_x_time_left", "increment", "p1_time_left"),
+    ("time_left_x_avg_elo", "p1_time_left", "avg_elo"),
+    ("p1_to_move_x_time_left", "p1_to_move", "p1_time_left"),]
+
+# Logistic regression is linear, so it gets the hand-made interactions.
+FEATURE_COLS = BASE_FEATURES + ["p1_to_move"] + [name for name, _, _ in INTERACTIONS]
+
+# Trees find interactions on their own, so gradient boosting only gets the
+# base features plus the derived p1_to_move flag.
+GB_FEATURES = BASE_FEATURES + ["p1_to_move"]
+
+
+def add_features(df):
+    df = df.copy()
+
+    # Flag for whether it is Player 1's turn to move
+    df["p1_to_move"] = (df["player_color"] == df["turn"]).astype(int)
+
+    # Multiply pairs of columns to create the interaction features
+    for name, col_a, col_b in INTERACTIONS:
+        df[name] = df[col_a] * df[col_b]
+
+    return df
+
+
+train_df = add_features(train_df)
+val_df = add_features(val_df)
+
+X_train = train_df[FEATURE_COLS]
+X_val = val_df[FEATURE_COLS]
+
+# Game result as a class index and as a text label
+y_train_idx = train_df["outcome"].map(OUTCOME_TO_INDEX).to_numpy()
+y_val_idx = val_df["outcome"].map(OUTCOME_TO_INDEX).to_numpy()
+y_train_labels = train_df["outcome"].map(OUTCOME_TO_LABEL)
+
+print(f"Logistic regression uses {len(FEATURE_COLS)} features "
+      f"(10 base + 1 derived + 13 interactions).")
+print(f"Gradient boosting uses {len(GB_FEATURES)} features (10 base + 1 derived).\n")
+
+# Standardize features (mean 0, std 1) so the L1 penalty treats them equally.
+# Otherwise large-valued features like Elo would look more important than Increment.
+# (Only needed for logistic regression; trees don't care about scale.)
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+
+
+
+# Model 1: Elo-Davidson baseline
+
+# The Davidson model turns two Elo ratings into P(win), P(draw), P(loss)
+# for Player 1. It has one free parameter, nu, which controls how likely draws are.
+
+def davidson_probabilities(elo1, elo2, nu):
+    rating1 = 10 ** (elo1 / 400)
+    rating2 = 10 ** (elo2 / 400)
+
+    draw_term = nu * np.sqrt(rating1 * rating2)
+    total = rating1 + rating2 + draw_term
+
+    return np.stack([rating1 / total, draw_term / total, rating2 / total], axis=1)
+
+
+# Try nu = 0.01, 0.02, ..., 1.00 and keep the one with the lowest training log loss
+candidate_nus = np.arange(0.01, 1.01, 0.01)
+train_losses = [
+    log_loss(
+        y_train_idx,
+        davidson_probabilities(train_df["p1_elo"].to_numpy(), train_df["p2_elo"].to_numpy(), nu),
+        labels=CLASS_INDICES,)
+    for nu in candidate_nus]
+best_nu = candidate_nus[int(np.argmin(train_losses))]
+print(f"  Davidson: best nu = {best_nu:.2f} (training log loss = {min(train_losses):.4f})\n")
+
+davidson_val_probs = davidson_probabilities(
+    val_df["p1_elo"].to_numpy(), val_df["p2_elo"].to_numpy(), best_nu)
+davidson = evaluate(y_val_idx, davidson_val_probs)
+
+
+
+# Model 2: L1 logistic regression on all features
+
+
+best_C = 0.1
+best_model = LogisticRegression(
+    l1_ratio=1.0,  # 1.0 = pure L1 penalty
+    solver="saga",
+    C=best_C,
+    max_iter=5000,
+    random_state=42,)
+best_model.fit(X_train_scaled, y_train_labels)
+
+train_probs = model_probabilities(best_model, X_train_scaled)
+best_train_loss = log_loss(y_train_idx, train_probs, labels=CLASS_INDICES)
+print(f"  Logistic regression: C = {best_C} (training log loss = {best_train_loss:.4f})\n")
+
+logreg_val_probs = model_probabilities(best_model, X_val_scaled)
+logreg = evaluate(y_val_idx, logreg_val_probs)
+
+# Find which features L1 dropped (zero coefficient in every class)
+coef_df = pd.DataFrame(best_model.coef_, columns=FEATURE_COLS, index=best_model.classes_)
+survived = [c for c in FEATURE_COLS if coef_df[c].abs().sum() > 1e-8]
+dropped = [c for c in FEATURE_COLS if c not in survived]
+print(f"{len(survived)}/{len(FEATURE_COLS)} logistic features kept a non-zero coefficient.")
+print(f"Dropped to zero by L1: {dropped}")
+
+# Rank features by the sum of absolute coefficients across the three classes.
+# This shows coefficient size, not causal importance. Features are standardized,
+# so the sizes are comparable.
+importance = coef_df.abs().sum(axis=0).sort_values(ascending=False)
+print("\nLogistic regression feature importance (sum of |coefficient| across classes):")
+print(importance)
+
+
+
+# Model 3: Gradient boosting
+
+Xg_train = train_df[GB_FEATURES]
+Xg_val = val_df[GB_FEATURES]
+
+# Small grid. We do NOT pick settings by training log loss, because it keeps
+# improving as trees are added. Instead we tune on a held-out slice of the
+# training data and leave the validation set untouched until the end.
+param_grid = {
+    "learning_rate": [0.05, 0.1],
+    "max_depth": [2, 3, 4],}
+
+Xg_fit, Xg_tune, y_fit, y_tune = train_test_split(
+    Xg_train, y_train_idx, test_size=0.2, stratify=y_train_idx, random_state=42)
+
+
+def make_gb(learning_rate, max_depth):
+    return GradientBoostingClassifier(
+        loss="log_loss",          # logistic loss / cross-entropy (multiclass)
+        n_estimators=1000,        # upper limit; early stopping picks the real number
+        learning_rate=learning_rate,
+        max_depth=max_depth,
+        subsample=0.8,            # stochastic boosting, reduces overfitting
+        n_iter_no_change=20,      # stop when an internal 10% slice stops improving
+        validation_fraction=0.1,
+        random_state=42,)
+
+
+best_gb_params, best_tune_loss = None, np.inf
+for lr, depth in itertools.product(param_grid["learning_rate"], param_grid["max_depth"]):
+    t0 = time.time()
+    candidate = make_gb(lr, depth).fit(Xg_fit, y_fit)
+    tune_loss = log_loss(y_tune, candidate.predict_proba(Xg_tune), labels=CLASS_INDICES)
+    print(f"  lr={lr:<5} depth={depth}  trees used={candidate.n_estimators_:<4} "
+          f"tuning log loss={tune_loss:.4f}  ({time.time() - t0:.0f}s)")
+    if tune_loss < best_tune_loss:
+        best_tune_loss, best_gb_params = tune_loss, {"learning_rate": lr, "max_depth": depth}
+
+print(f"\n  Gradient boosting: selected {best_gb_params} (tuning log loss = {best_tune_loss:.4f})\n")
+
+# Refit the chosen setting on the full training set, then evaluate once on validation.
+gb_model = make_gb(**best_gb_params).fit(Xg_train, y_train_idx)
+
+# classes_ are the integer indices 0/1/2 = win/draw/loss, so predict_proba
+# columns are already in win / draw / loss order.
+assert list(gb_model.classes_) == CLASS_INDICES
+gb_val_probs = gb_model.predict_proba(Xg_val)
+gb = evaluate(y_val_idx, gb_val_probs)
+print(f"  Trees used after early stopping: {gb_model.n_estimators_}\n")
+
+
+
+
+print("=" * 65)
+print(f"{'Metric':<12}{'Davidson':>15}{'L1 LogReg':>18}{'Grad. boosting':>18}")
+print("=" * 65)
+print(f"{'Log loss':<12}{davidson['log_loss']:>15.4f}{logreg['log_loss']:>18.4f}{gb['log_loss']:>18.4f}")
+print(f"{'Accuracy':<12}{davidson['accuracy']:>15.4f}{logreg['accuracy']:>18.4f}{gb['accuracy']:>18.4f}")
+print("=" * 65)
+
+for name, res in [("Davidson", davidson), ("LogReg", logreg), ("Gradient boosting", gb)]:
+    print(f"\n{name} confusion matrix (rows=actual, cols=predicted; Win/Draw/Loss):")
+    print(res["confusion"])
+    print(f"\n{name} per-class report:")
+    print(classification_report(y_val_idx, res["pred"], target_names=CLASS_ORDER,
+                                labels=CLASS_INDICES, zero_division=0))
+
+# Are the log-loss differences bigger than noise? (same games; CI containing 0 = no clear difference)
+print("Paired log-loss comparisons on validation games:")
+paired_log_loss_diff(y_val_idx, davidson_val_probs, logreg_val_probs, "Davidson", "logistic")
+paired_log_loss_diff(y_val_idx, davidson_val_probs, gb_val_probs, "Davidson", "boosting")
+paired_log_loss_diff(y_val_idx, logreg_val_probs, gb_val_probs, "logistic", "boosting")
+
+# Permutation importance: shuffle one feature on the validation set and see how
+# much log loss gets worse.
+perm = permutation_importance(
+    gb_model, Xg_val, y_val_idx, scoring="neg_log_loss",
+    n_repeats=5, random_state=42, n_jobs=-1,)
+perm_df = pd.DataFrame({
+    "feature": GB_FEATURES,
+    "log loss increase when shuffled": perm.importances_mean,
+    "std": perm.importances_std,
+}).sort_values("log loss increase when shuffled", ascending=False)
+print("\nGradient boosting permutation importance (validation set):")
+print(perm_df.round(4).to_string(index=False))
+
+# Plot: predicted vs observed outcome frequencies by Stockfish evaluation (20 equal-sized bins)
+ev = val_df["stockfish_eval"].to_numpy()
+bins = pd.qcut(ev, q=20, duplicates="drop")
+fig, ax = plt.subplots(figsize=(7, 4.5))
+x = pd.Series(ev).groupby(bins, observed=True).mean()
+for idx, label in enumerate(CLASS_ORDER):
+    obs = pd.Series((y_val_idx == idx).astype(float)).groupby(bins, observed=True).mean()
+    pred = pd.Series(gb_val_probs[:, idx]).groupby(bins, observed=True).mean()
+    ax.plot(x, obs, "o", label=f"observed {label}")
+    ax.plot(x, pred, "-", label=f"boosting P({label})")
+ax.set_xlabel("Stockfish evaluation (binned mean)")
+ax.set_ylabel("Probability")
+ax.set_title("Gradient boosting: predicted vs observed outcome by engine eval")
+ax.legend(fontsize=7)
+plt.tight_layout()
+plt.savefig("gb_eval_calibration.png", dpi=200)
+
+tree_results = {}
+for depth in (3, 4):
+    tree = DecisionTreeClassifier(
+        max_depth=depth,
+        min_samples_leaf=200,  # keeps leaves big enough for sensible probabilities
+        random_state=42,).fit(Xg_train, y_train_idx)
+
+    assert list(tree.classes_) == CLASS_INDICES  # columns = win / draw / loss
+    tree_val_probs = tree.predict_proba(Xg_val)
+    tree_results[depth] = evaluate(y_val_idx, tree_val_probs)
+
+    print(f"\nDecision tree, depth {depth}: "
+          f"val log loss = {tree_results[depth]['log_loss']:.4f}, "
+          f"accuracy = {tree_results[depth]['accuracy']:.4f}")
+
+
+    # Picture of the tree
+    fig_t, ax_t = plt.subplots(figsize=(22 if depth == 3 else 34, 9 if depth == 3 else 12))
+    plot_tree(
+        tree, feature_names=GB_FEATURES, class_names=CLASS_ORDER,
+        filled=True, rounded=True, impurity=False, proportion=True,
+        fontsize=9 if depth == 3 else 7, ax=ax_t,)
+    ax_t.set_title(f"Decision tree, depth {depth} (percentages = share of games in each node)")
+    plt.tight_layout()
+    plt.savefig(f"decision_tree_depth{depth}.png", dpi=200)
+
+print("\n" + "=" * 52)
+print(f"{'Model':<28}{'Log loss':>12}{'Accuracy':>12}")
+print("=" * 52)
+print(f"{'Elo-Davidson':<28}{davidson['log_loss']:>12.4f}{davidson['accuracy']:>12.4f}")
+print(f"{'L1 logistic regression':<28}{logreg['log_loss']:>12.4f}{logreg['accuracy']:>12.4f}")
+print(f"{'Decision tree (depth 3)':<28}{tree_results[3]['log_loss']:>12.4f}{tree_results[3]['accuracy']:>12.4f}")
+print(f"{'Decision tree (depth 4)':<28}{tree_results[4]['log_loss']:>12.4f}{tree_results[4]['accuracy']:>12.4f}")
+print(f"{'Gradient boosting':<28}{gb['log_loss']:>12.4f}{gb['accuracy']:>12.4f}")
+print("=" * 52)
+plt.show()
