@@ -53,9 +53,9 @@ def paired_log_loss_diff(true_indices, probs_a, probs_b, name_a, name_b):
           f"95% CI [{mean - 1.96 * se:+.5f}, {mean + 1.96 * se:+.5f}]")
 
 
-# ---------------------------------------------------------------------
+
 # Data
-# ---------------------------------------------------------------------
+
 # Rename columns to shorter names in code (the CSV files were prepared
 # 6 months ago for other uses, so the files themselves stay unchanged)
 COLUMN_MAP = {
@@ -185,7 +185,7 @@ davidson = evaluate(y_val_idx, davidson_val_probs)
 
 # Model 2: L1 logistic regression on all features
 
-
+#Note we first made the whole procedure to determine the best C value based on log loss, then later simply changed it to 0.1 based on our previous results 
 best_C = 0.1
 best_model = LogisticRegression(
     l1_ratio=1.0,  # 1.0 = pure L1 penalty
